@@ -65,17 +65,6 @@ python3 a2l2xdf.py your_ecu.a2l --output output.xdf --no-adx
 pip install pya2ldb
 ```
 
----
-
-## Documentation
-
-- **[SPEC_COMPLIANCE_AUDIT.md](SPEC_COMPLIANCE_AUDIT.md)** - Complete specification compliance report
-- **[FIXES_APPLIED.md](FIXES_APPLIED.md)** - Axis handling and COLUMN_DIR fixes
-- **[DATA_TYPES_AUDIT.md](DATA_TYPES_AUDIT.md)** - Data type coverage analysis
-- **[STATUS.md](STATUS.md)** - Project status and roadmap
-
----
-
 ## Recent Updates
 
 ### v2.1 (December 2024) - Metadata & Validation
