@@ -47,6 +47,84 @@ DEFAULT_ADX_POLL_RATE_MS = 100  # milliseconds
 MAX_AXIS_RESOLUTION_DEPTH = 2
 
 # --------------------------------------------------------------------------- #
+# Validation and Diagnostics                                                  #
+# --------------------------------------------------------------------------- #
+
+class ValidationReport:
+    """Collects validation warnings, errors, and info during conversion."""
+    
+    def __init__(self):
+        self.warnings = []
+        self.errors = []
+        self.info = []
+        self.address_map = {}  # address -> list of characteristic names
+        
+    def add_warning(self, msg: str):
+        """Add a warning message."""
+        self.warnings.append(msg)
+        logging.warning(msg)
+    
+    def add_error(self, msg: str):
+        """Add an error message."""
+        self.errors.append(msg)
+        logging.error(msg)
+    
+    def add_info(self, msg: str):
+        """Add an info message."""
+        self.info.append(msg)
+    
+    def check_address_overlap(self, name: str, address: str, size: int):
+        """Check if address overlaps with existing characteristics."""
+        if not address:
+            return
+            
+        try:
+            addr_int = int(address, 16) if isinstance(address, str) else address
+        except (ValueError, TypeError):
+            return
+        
+        # Check for exact address match
+        if addr_int in self.address_map:
+            existing = self.address_map[addr_int]
+            self.add_warning(
+                f"Address overlap: {name} shares address {hex(addr_int)} "
+                f"with {', '.join(existing)}"
+            )
+            existing.append(name)
+        else:
+            self.address_map[addr_int] = [name]
+    
+    def print_summary(self):
+        """Print validation summary to console."""
+        print("\n" + "="*60)
+        print("VALIDATION SUMMARY")
+        print("="*60)
+        
+        if self.errors:
+            print(f"\n❌ ERRORS ({len(self.errors)}):")
+            for err in self.errors[:10]:  # Show first 10
+                print(f"  - {err}")
+            if len(self.errors) > 10:
+                print(f"  ... and {len(self.errors) - 10} more")
+        
+        if self.warnings:
+            print(f"\n⚠️  WARNINGS ({len(self.warnings)}):")
+            for warn in self.warnings[:10]:
+                print(f"  - {warn}")
+            if len(self.warnings) > 10:
+                print(f"  ... and {len(self.warnings) - 10} more")
+        
+        if self.info:
+            print(f"\n✓ INFO:")
+            for inf in self.info:
+                print(f"  - {inf}")
+        
+        print("="*60 + "\n")
+
+# Global validation report instance
+validation_report = ValidationReport()
+
+# --------------------------------------------------------------------------- #
 # Helpers for record layouts and endian/padding                               #
 # --------------------------------------------------------------------------- #
 
@@ -174,6 +252,101 @@ def align_address(addr: int, alignment_bits: int) -> int:
         return addr
     mask = (alignment_bits // 8) - 1
     return (addr + mask) & ~mask
+
+
+class LayoutComponent:
+    def __init__(self, name, position, datatype, relation):
+        self.name = name
+        self.position = int(position)
+        self.datatype = str(datatype)
+        self.relation = relation  # 'NO_AXIS', 'AXIS_PTS', 'FNC_VALUES'
+
+    def __repr__(self):
+        return f"<LayoutComponent {self.name} pos={self.position} type={self.datatype}>"
+
+
+def parse_record_layout(rl) -> List[LayoutComponent]:
+    """
+    Parse a pya2l RecordLayout object into a sorted list of components.
+    """
+    components = []
+    if rl is None:
+        return components
+
+    # Map of attribute name -> relation type
+    # Note: pya2l uses snake_case for attributes
+    attrs = {
+        "no_axis_pts_x": "NO_AXIS",
+        "no_axis_pts_y": "NO_AXIS",
+        "no_axis_pts_z": "NO_AXIS",
+        "no_axis_pts_4": "NO_AXIS",
+        "no_axis_pts_5": "NO_AXIS",
+        "axis_pts_x": "AXIS_PTS",
+        "axis_pts_y": "AXIS_PTS",
+        "axis_pts_z": "AXIS_PTS",
+        "axis_pts_4": "AXIS_PTS",
+        "axis_pts_5": "AXIS_PTS",
+        "fnc_values": "FNC_VALUES",
+    }
+
+    # 1. Check direct attributes (covers fncValues and flat layouts)
+    for attr, relation in attrs.items():
+        val = getattr(rl, attr, None)
+        if val is None:
+            # Try CamelCase fallback
+            parts = attr.split('_')
+            camel = parts[0] + ''.join(x.title() for x in parts[1:])
+            val = getattr(rl, camel, None)
+        
+        if val is not None:
+            try:
+                pos = getattr(val, "position", 0)
+                dtype = getattr(val, "datatype", getattr(val, "data_type", "UBYTE"))
+                components.append(LayoutComponent(attr, pos, dtype, relation))
+            except Exception:
+                pass
+
+    # 2. Check 'axes' dictionary (nested structure)
+    axes_attr = getattr(rl, "axes", None)
+    if axes_attr:
+        for axis_key, axis_data in axes_attr.items():
+            # axis_key is 'x', 'y', 'z', etc.
+            if not isinstance(axis_data, dict):
+                continue
+                
+            # Check for axis_pts
+            if "axis_pts" in axis_data:
+                val = axis_data["axis_pts"]
+                try:
+                    pos = getattr(val, "position", 0)
+                    dtype = getattr(val, "datatype", getattr(val, "data_type", "UBYTE"))
+                    name = f"axis_pts_{axis_key}"
+                    components.append(LayoutComponent(name, pos, dtype, "AXIS_PTS"))
+                except Exception:
+                    pass
+
+            # Check for no_axis_pts
+            if "no_axis_pts" in axis_data:
+                val = axis_data["no_axis_pts"]
+                try:
+                    pos = getattr(val, "position", 0)
+                    dtype = getattr(val, "datatype", getattr(val, "data_type", "UBYTE"))
+                    name = f"no_axis_pts_{axis_key}"
+                    components.append(LayoutComponent(name, pos, dtype, "NO_AXIS"))
+                except Exception:
+                    pass
+
+    # Deduplicate components by position (in case we found same component via both methods)
+    # Prefer the one with a valid name matching our attrs map if possible, or just keep one.
+    unique_components = {}
+    for c in components:
+        unique_components[c.position] = c
+    components = list(unique_components.values())
+
+    # Sort by position
+    components.sort(key=lambda x: x.position)
+    logging.debug("Parsed Record Layout %s: %s", getattr(rl, 'name', 'unknown'), components)
+    return components
 
 
 def parse_address_mappings(a2l_path: str) -> List[Dict[str, int]]:
@@ -804,16 +977,6 @@ def generate_fixed_axis_values(ar, axis_type: str):
 def detect_axis_type(ar: inspect.AxisDescr) -> str:
     """Detect what type of axis definition this is."""
 
-    # Fixed axes (FIX_AXIS)
-    if getattr(ar, "fixAxisPar", None) is not None:
-        return "FIX_AXIS_PAR"
-
-    if getattr(ar, "fixAxisParDist", None) is not None:
-        return "FIX_AXIS_PAR_DIST"
-
-    if getattr(ar, "fixAxisParList", None) is not None:
-        return "FIX_AXIS_PAR_LIST"
-
     # Curve axis reference (used sometimes to share axes)
     if getattr(ar, "curveAxisRef", None) is not None:
         return "CURVE_AXIS_REF"
@@ -844,6 +1007,16 @@ def detect_axis_type(ar: inspect.AxisDescr) -> str:
             return "STD_AXIS_DEPOSIT_ABSOLUTE"
         return "DEPOSIT_ABSOLUTE_NO_PARAMS"
 
+    # Fixed axes (FIX_AXIS) - Check LAST as fallback if no memory layout found
+    if getattr(ar, "fixAxisPar", None) is not None:
+        return "FIX_AXIS_PAR"
+
+    if getattr(ar, "fixAxisParDist", None) is not None:
+        return "FIX_AXIS_PAR_DIST"
+
+    if getattr(ar, "fixAxisParList", None) is not None:
+        return "FIX_AXIS_PAR_LIST"
+
     logging.debug(
         "AxisDescr %r with source %s has no axis layout and no known deposit type",
         ar, source_tag,
@@ -865,17 +1038,42 @@ def _axis_ref_to_dict_inner(ar: inspect.AxisDescr, depth: int = 0) -> Optional[D
 
     axis_obj, source_tag = resolve_axis_source(ar)
     axis_name = "unknown"
+    axis_description = None
+    input_quantity = None
     units = ""
     compu = None
     enum_map: Dict[str, str] = {}
     range_map: Dict[str, str] = {}
 
     if axis_obj is not None:
+        # Get the basic name
         axis_name = getattr(axis_obj, "name", axis_name)
+        
+        # Get longIdentifier (detailed description) if available
+        axis_description = getattr(axis_obj, "longIdentifier", None)
+        
+        # Get inputQuantity (physical meaning) if available
+        input_quantity = getattr(axis_obj, "inputQuantity", None)
+        
+        # Get COMPU_METHOD for units
         compu = getattr(axis_obj, "compuMethod", None)
 
+    # Fallback: try to get inputQuantity and compu from AXIS_DESCR itself
+    if input_quantity is None:
+        input_quantity = getattr(ar, "inputQuantity", None)
+    
     if compu is None:
         compu = getattr(ar, "compuMethod", None)
+
+    # Build a rich, user-friendly axis name
+    # Format: "inputQuantity (axis_name): description"
+    # Example: "nmot (MDV08_UC): Datapoint distribution for torque in instruction test"
+    display_name = axis_name
+    if input_quantity and input_quantity != axis_name:
+        display_name = f"{input_quantity} ({axis_name})"
+    
+    if axis_description:
+        display_name = f"{display_name}: {axis_description}"
 
     if compu is not None:
         units = fix_degree(compu.unit)
@@ -917,7 +1115,7 @@ def _axis_ref_to_dict_inner(ar: inspect.AxisDescr, depth: int = 0) -> Optional[D
         stride_bytes = get_dist_op_stride(axis_layout)
 
         return {
-            "name": axis_name,
+            "name": display_name,
             "units": units,
             "min": getattr(ar, "lowerLimit", 0.0),
             "max": getattr(ar, "upperLimit", 0.0),
@@ -942,7 +1140,7 @@ def _axis_ref_to_dict_inner(ar: inspect.AxisDescr, depth: int = 0) -> Optional[D
             return None
 
         return {
-            "name": axis_name,
+            "name": display_name,
             "units": units,
             "min": min(values),
             "max": max(values),
@@ -996,7 +1194,7 @@ def _axis_ref_to_dict_inner(ar: inspect.AxisDescr, depth: int = 0) -> Optional[D
 
         # Return with special marker - address will be calculated by caller
         return {
-            "name": axis_name,
+            "name": display_name,
             "units": units,
             "min": getattr(ar, "lowerLimit", 0.0),
             "max": getattr(ar, "upperLimit", 0.0),
@@ -1327,6 +1525,14 @@ def write_pretty_xml(root, out):
     parsed = minidom.parseString(buf.getvalue())
     with open(out, "w", encoding="utf-8") as f:
         f.write(parsed.toprettyxml(indent="  "))
+    print("  - Processed {} unique addresses".format(len(data_addresses_in_xdf)))
+    print("  - Total characteristics: {}".format(len(char_type_stats) + sum(char_type_stats.values()) if not char_type_stats else sum(char_type_stats.values()))) # wait, char_type_stats has counts. sum() is correct.
+    # Recalculate char stats sum correctly from Counter
+    total_chars = sum(char_type_stats.values())
+    print("  - Total characteristics: {}".format(total_chars))
+    print("  - Total functions: {}".format(function_count))
+    print("  - Functions with descriptions: {}".format(len(function_descriptions)))
+    print("============================================================")
 
 
 # =============================================================================
@@ -1774,13 +1980,30 @@ def process_all(session, root, header, args):
 
     # Pre-compute characteristic -> categories from FUNCTION/GROUP if available
     char_categories: Dict[str, Set[str]] = {}
+    function_descriptions: Dict[str, str] = {}  # function name -> description
+    
     try:
         functions = session.query(model.Function).all()
         for f in functions:
             fn_name = getattr(f, "name", None)
-            defs = getattr(f, "defCharacteristics", None) or getattr(f, "def_characteristics", None) or []
+            fn_desc = getattr(f, "longIdentifier", None)
+            
+            # Store function description
+            if fn_name and fn_desc:
+                function_descriptions[fn_name] = fn_desc
+            
+            # Map characteristics to functions
+            defs = getattr(f, "def_characteristic", None) or getattr(f, "defCharacteristics", None) or []
             for ch in defs:
-                char_categories.setdefault(ch, set()).add(f"FUNC:{fn_name}")
+                # If ch is an object, get its name
+                ch_name = getattr(ch, "name", str(ch))
+                char_categories.setdefault(ch_name, set()).add(f"FUNC:{fn_name}")
+            
+            # Also check ref_characteristic if available
+            refs = getattr(f, "ref_characteristic", None) or getattr(f, "refCharacteristics", None) or []
+            for ch in refs:
+                ch_name = getattr(ch, "name", str(ch))
+                char_categories.setdefault(ch_name, set()).add(f"FUNC:{fn_name}")
     except Exception:
         pass
     try:
@@ -1856,6 +2079,14 @@ def process_all(session, root, header, args):
         # Titles should be the variable name; put descriptive text in description
         title = c.name
         description = ci.longIdentifier or ci.displayIdentifier or ""
+        
+        # Add FORMAT string if available
+        format_obj = getattr(c, "format", None) or getattr(ci, "format", None)
+        if format_obj:
+            # Extract formatString from the Format object
+            format_str = getattr(format_obj, "formatString", None) or str(format_obj)
+            if format_str and "formatString" not in format_str:  # Avoid showing the whole object
+                description += f"\nFormat: {format_str}"
 
         # Variant filter
         variant = getattr(c, "variantCoding", None) or getattr(c, "variant_coding", None)
@@ -1881,7 +2112,18 @@ def process_all(session, root, header, args):
         # Add function/group categories if present
         extra_cats = list(char_categories.get(c.name, []))
         for cat in extra_cats:
-            add_category(header, cat)
+            # Add function description to category name if available
+            if cat.startswith("FUNC:"):
+                fn_name = cat.split(":", 1)[1]
+                fn_desc = function_descriptions.get(fn_name)
+                if fn_desc:
+                    # Create enhanced category name with description
+                    enhanced_cat = f"{cat}: {fn_desc}"
+                    add_category(header, enhanced_cat)
+                else:
+                    add_category(header, cat)
+            else:
+                add_category(header, cat)
 
         td: Dict[str, Any] = {
             "title": title,
@@ -1918,31 +2160,63 @@ def process_all(session, root, header, args):
             td["z"]["length"] = 1
             logging.debug("Characteristic %s detected as VALUE (scalar)", c.name)
 
+        # Parse Record Layout for dynamic offset calculation
+        layout_components = parse_record_layout(record_layout)
+        component_offsets = {}
+        current_rel_offset = 0
+        
+        # Get axis lengths (needed for size calculation)
         axes = ci.axisDescriptions
+        x_len = 1
+        y_len = 1
+        if len(axes) > 0:
+             x_len = int(getattr(axes[0], "maxAxisPoints", 1) or 1)
+        if len(axes) > 1:
+             y_len = int(getattr(axes[1], "maxAxisPoints", 1) or 1)
 
-        # Track offset for inline axis address calculation
-        # For CURVE/MAP with STD_AXIS DEPOSIT ABSOLUTE, axis data precedes Z data
-        inline_axis_offset = 0
+        for comp in layout_components:
+            component_offsets[comp.name] = current_rel_offset
+            
+            size = 0
+            if comp.relation == "NO_AXIS":
+                size = get_data_size(comp.datatype)
+            elif comp.relation == "AXIS_PTS":
+                dsize = get_data_size(comp.datatype)
+                if "_x" in comp.name:
+                    size = x_len * dsize
+                elif "_y" in comp.name:
+                    size = y_len * dsize
+            
+            current_rel_offset += size
 
         # X axis
         if len(axes) > 0:
             x_info = axis_ref_to_dict(axes[0])
+
             if x_info is not None:
                 # Handle inline axis (STD_AXIS DEPOSIT ABSOLUTE)
                 if x_info.get("inline_axis"):
-                    # Axis data is at characteristic address + offset
-                    # First comes the axis length byte, then axis values
-                    axis_addr = align_address(base_addr_raw + inline_axis_offset, alignment_bits)
-                    x_info["address"] = hex(adjust_address(axis_addr))
-                    # Update offset: 1 byte for count + (length * datasize)
-                    inferred_dt = infer_axis_datatype(ci, 0) or x_info.get("dataSize", "UBYTE")
-                    x_info["dataSize"] = inferred_dt
-                    axis_data_size = get_data_size(inferred_dt)
-                    inline_axis_offset += 1 + (x_info["length"] * axis_data_size)
-                    logging.debug(
-                        "Characteristic %s: X axis is inline at 0x%X, offset now %d",
-                        c.name, axis_addr, inline_axis_offset
-                    )
+                    # Use calculated offset from Record Layout
+                    # We look for axis_pts_x (standard) or fallback to heuristic if missing
+                    # But for STD_AXIS, it should be in the layout.
+                    
+                    # Find the component name for X axis points
+                    pts_comp = next((c for c in layout_components if c.relation == "AXIS_PTS" and "_x" in c.name), None)
+                    
+                    if pts_comp:
+                        offset = component_offsets[pts_comp.name]
+                        axis_addr = align_address(base_addr_raw + offset, alignment_bits)
+                        x_info["address"] = hex(adjust_address(axis_addr))
+                        
+                        # Use datatype from Record Layout if available
+                        x_info["dataSize"] = pts_comp.datatype
+                        
+                        logging.debug(
+                            "Characteristic %s: X axis inline at 0x%X (offset %d) via %s",
+                            c.name, axis_addr, offset, pts_comp.name
+                        )
+                    else:
+                        logging.warning("Characteristic %s: Inline X axis but no AXIS_PTS_X in Record Layout", c.name)
 
                 x_info["lsb_first"] = lsb_first
 
@@ -1961,16 +2235,20 @@ def process_all(session, root, header, args):
             if y_info is not None:
                 # Handle inline axis (STD_AXIS DEPOSIT ABSOLUTE)
                 if y_info.get("inline_axis"):
-                    axis_addr = align_address(base_addr_raw + inline_axis_offset, alignment_bits)
-                    y_info["address"] = hex(adjust_address(axis_addr))
-                    inferred_dt = infer_axis_datatype(ci, 1) or y_info.get("dataSize", "UBYTE")
-                    y_info["dataSize"] = inferred_dt
-                    axis_data_size = get_data_size(inferred_dt)
-                    inline_axis_offset += 1 + (y_info["length"] * axis_data_size)
-                    logging.debug(
-                        "Characteristic %s: Y axis is inline at 0x%X, offset now %d",
-                        c.name, axis_addr, inline_axis_offset
-                    )
+                    pts_comp = next((c for c in layout_components if c.relation == "AXIS_PTS" and "_y" in c.name), None)
+                    
+                    if pts_comp:
+                        offset = component_offsets[pts_comp.name]
+                        axis_addr = align_address(base_addr_raw + offset, alignment_bits)
+                        y_info["address"] = hex(adjust_address(axis_addr))
+                        y_info["dataSize"] = pts_comp.datatype
+                        
+                        logging.debug(
+                            "Characteristic %s: Y axis inline at 0x%X (offset %d) via %s",
+                            c.name, axis_addr, offset, pts_comp.name
+                        )
+                    else:
+                        logging.warning("Characteristic %s: Inline Y axis but no AXIS_PTS_Y in Record Layout", c.name)
 
                 y_info["lsb_first"] = lsb_first
 
@@ -1984,15 +2262,6 @@ def process_all(session, root, header, args):
                 continue
 
         # Handle COLUMN_DIR: Swap X and Y axes to match XDF row-major expectations
-        # In A2L COLUMN_DIR: data stored column-by-column (Y varies fastest)
-        # In XDF: always expects row-major (X varies fastest)
-        # So we swap axes AND swap length/rows so data interpretation is correct
-        #
-        # IMPORTANT for inline axes: The physical memory layout does NOT change!
-        # Memory still has: [X-axis data][Y-axis data][Z data in column-major order]
-        # We only swap the INTERPRETATION - which axis we call "X" vs "Y" in XDF
-        # The addresses calculated above remain correct because they point to the
-        # actual physical positions in memory, which don't move.
         if index_mode == "COLUMN_DIR" and len(axes) > 1:
             if "x" in td and "y" in td:
                 # Swap axis assignments
@@ -2011,13 +2280,15 @@ def process_all(session, root, header, args):
                     c.name, x_name, td["z"]["length"], y_name, td["z"]["rows"]
                 )
 
-        # Update Z axis address if we have inline axes
-        if inline_axis_offset > 0:
-            z_addr = align_address(base_addr_raw + inline_axis_offset, alignment_bits)
+        # Update Z axis address based on FNC_VALUES offset
+        fnc_comp = next((c for c in layout_components if c.relation == "FNC_VALUES"), None)
+        if fnc_comp:
+            offset = component_offsets[fnc_comp.name]
+            z_addr = align_address(base_addr_raw + offset, alignment_bits)
             td["z"]["address"] = hex(adjust_address(z_addr))
             logging.debug(
-                "Characteristic %s: Z data at 0x%X (after inline axes)",
-                c.name, z_addr
+                "Characteristic %s: Z data at 0x%X (offset %d) via %s",
+                c.name, z_addr, offset, fnc_comp.name
             )
 
         # Track address range for overlap check (if we know address and length)
@@ -2032,6 +2303,11 @@ def process_all(session, root, header, args):
                     stride_bits = td["z"]["stride_bytes"] * 8
                 _, end_addr = addr_range(addr_int, elem_bits, cols * rows, alignment_bits, stride_bits)
                 z_ranges.append((addr_int, end_addr))
+                
+                # Validation: check for address overlaps
+                if args.validate:
+                    size = get_data_size(td["z"].get("dataSize")) * cols * rows
+                    validation_report.check_address_overlap(c.name, td["z"]["address"], size)
         except Exception:
             pass
 
@@ -2128,6 +2404,8 @@ def process_all(session, root, header, args):
         logging.info("")
         logging.info("Note: Only MEMORY_MAPPED and FIX_* axes get full XDF support.")
         logging.info("      Purely computed axes without addresses are skipped.")
+    
+    return processed_count, len(functions) if 'functions' in locals() else 0
 
 
 def parse_args():
@@ -2151,6 +2429,7 @@ def parse_args():
     p.add_argument("--big-endian", action="store_true", help="Set ADX channels to MSB-first")
     p.add_argument("--force-db", action="store_true", help="Rebuild .a2ldb cache if it already exists")
     p.add_argument("--variant", help="Variant name to include (if variantCoding present)", default=None)
+    p.add_argument("--validate", action="store_true", help="Enable validation and diagnostics")
     p.add_argument("--log-level", default=None, help="Logging level (DEBUG,INFO,WARNING,ERROR)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -2244,7 +2523,7 @@ def main():
     except Exception:
         SEGMENTS = []
 
-    process_all(session, root, header, args)
+    processed_count, function_count = process_all(session, root, header, args)
 
     out = args.output or f"{a2l_base}.xdf"
     write_pretty_xml(root, out)
@@ -2262,6 +2541,17 @@ def main():
             logging.info("Wrote ADX: %s (%d channels)", adx_out, meas_count)
         else:
             logging.info("No measurements found - ADX file not created")
+    
+    # Print validation summary if enabled
+    if args.validate:
+        # Add summary info messages
+        validation_report.add_info(f"Processed {len(validation_report.address_map)} unique addresses")
+        validation_report.add_info(f"Total characteristics: {sum(char_type_stats.values())}")
+        if function_count > 0:
+            validation_report.add_info(f"Functions with descriptions: {function_count}")
+        
+        # Print the summary
+        validation_report.print_summary()
 
 
 if __name__ == "__main__":
