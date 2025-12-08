@@ -57,7 +57,14 @@ class ValidationReport:
         self.warnings = []
         self.errors = []
         self.info = []
-        self.address_map = {}  # address -> list of characteristic names
+        # {address: [characteristic_names]} for overlap detection
+        self.address_map: Dict[int, List[str]] = {}
+        
+        # Cross-reference tracking
+        self.axis_pts_defined: Set[str] = set()  # All AXIS_PTS names defined
+        self.axis_pts_referenced: Set[str] = set()  # All AXIS_PTS names referenced
+        self.char_defined: Set[str] = set()  # All CHARACTERISTIC names defined
+        self.char_referenced: Set[str] = set()  # All CHARACTERISTIC names referenced by FUNCTION/GROUPof characteristic names
         
     def add_warning(self, msg: str):
         """Add a warning message."""
@@ -95,31 +102,466 @@ class ValidationReport:
             self.address_map[addr_int] = [name]
     
     def print_summary(self):
-        """Print validation summary to console."""
-        print("\n" + "="*60)
+        """Print a summary of validation results."""
+        if not self.errors and not self.warnings and not self.info:
+            return
+
+        print("\n" + "=" * 60)
         print("VALIDATION SUMMARY")
-        print("="*60)
-        
+        print("=" * 60)
+
         if self.errors:
             print(f"\n❌ ERRORS ({len(self.errors)}):")
-            for err in self.errors[:10]:  # Show first 10
+            for err in self.errors[:20]:  # Limit output
                 print(f"  - {err}")
-            if len(self.errors) > 10:
-                print(f"  ... and {len(self.errors) - 10} more")
-        
+            if len(self.errors) > 20:
+                print(f"  ... and {len(self.errors) - 20} more")
+
         if self.warnings:
-            print(f"\n⚠️  WARNINGS ({len(self.warnings)}):")
-            for warn in self.warnings[:10]:
+            print(f"\n⚠️ WARNINGS ({len(self.warnings)}):")
+            for warn in self.warnings[:20]:
                 print(f"  - {warn}")
-            if len(self.warnings) > 10:
-                print(f"  ... and {len(self.warnings) - 10} more")
-        
+            if len(self.warnings) > 20:
+                print(f"  ... and {len(self.warnings) - 20} more")
+
         if self.info:
-            print(f"\n✓ INFO:")
-            for inf in self.info:
-                print(f"  - {inf}")
+            print("\n✓ INFO:")
+            for msg in self.info:
+                print(f"  - {msg}")
+
+        print("=" * 60 + "\n")
+
+    def add_axis_pts_definition(self, name: str):
+        """Track an AXIS_PTS definition."""
+        self.axis_pts_defined.add(name)
+    
+    def add_axis_pts_reference(self, name: str):
+        """Track an AXIS_PTS reference."""
+        self.axis_pts_referenced.add(name)
+    
+    def add_char_definition(self, name: str):
+        """Track a CHARACTERISTIC definition."""
+        self.char_defined.add(name)
+    
+    def add_char_reference(self, name: str):
+        """Track a CHARACTERISTIC reference from FUNCTION/GROUP."""
+        self.char_referenced.add(name)
+    
+    def validate_cross_references(self):
+        """Validate cross-references and report orphaned/broken items."""
+        # Orphaned AXIS_PTS (defined but never used)
+        orphaned_axes = self.axis_pts_defined - self.axis_pts_referenced
+        if orphaned_axes:
+            self.add_warning(f"Found {len(orphaned_axes)} orphaned AXIS_PTS (defined but never referenced)")
+            for axis in sorted(list(orphaned_axes)[:10]):  # Limit to 10 examples
+                self.add_info(f"  Orphaned axis: {axis}")
+            if len(orphaned_axes) > 10:
+                self.add_info(f"  ... and {len(orphaned_axes) - 10} more")
         
-        print("="*60 + "\n")
+        # Broken AXIS_PTS references (used but not defined)
+        broken_axis_refs = self.axis_pts_referenced - self.axis_pts_defined
+        if broken_axis_refs:
+            self.add_error(f"Found {len(broken_axis_refs)} broken AXIS_PTS references")
+            for axis in sorted(list(broken_axis_refs)[:10]):
+                self.add_error(f"  Missing axis definition: {axis}")
+        
+        # Unreferenced CHARACTERISTICs (not in any FUNCTION/GROUP)
+        unreferenced_chars = self.char_defined - self.char_referenced
+        if unreferenced_chars:
+            self.add_info(f"Found {len(unreferenced_chars)} characteristics not categorized in FUNCTION/GROUP")
+            # This is informational, not necessarily a problem
+
+    def write_html(self, output_path: str):
+        """Write validation report to an HTML file."""
+        html_template = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A2L Validation Report</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            line-height: 1.6; 
+            color: #1a1a1a; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }}
+        .header h1 {{ 
+            font-size: 2.5em; 
+            font-weight: 700;
+            margin-bottom: 10px;
+            text-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        }}
+        .header p {{ 
+            opacity: 0.9; 
+            font-size: 1.1em;
+        }}
+        .content {{ padding: 40px; }}
+        
+        .summary-cards {{ 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 25px; 
+            margin-bottom: 40px; 
+        }}
+        .card {{ 
+            padding: 30px; 
+            border-radius: 15px; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }}
+        .card::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 5px;
+            height: 100%;
+            transition: width 0.3s ease;
+        }}
+        .card:hover {{ 
+            transform: translateY(-5px); 
+            box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        }}
+        .card:hover::before {{ width: 100%; opacity: 0.05; }}
+        
+        .card.error {{ background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%); }}
+        .card.error::before {{ background: #e53e3e; }}
+        .card.warning {{ background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); }}
+        .card.warning::before {{ background: #f59e0b; }}
+        .card.info {{ background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); }}
+        .card.info::before {{ background: #3b82f6; }}
+        
+        .card h3 {{ 
+            font-size: 0.9em; 
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            opacity: 0.7;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }}
+        .card .count {{ 
+            font-size: 3em; 
+            font-weight: 800;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        
+        .memory-map {{
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 40px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }}
+        .memory-map h2 {{
+            margin-bottom: 25px;
+            color: #1e293b;
+            font-size: 1.8em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .memory-map h2::before {{
+            content: '🗺️';
+            font-size: 1.2em;
+        }}
+        
+        .memory-stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .memory-stat {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }}
+        .memory-stat-label {{
+            font-size: 0.85em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #64748b;
+            margin-bottom: 8px;
+        }}
+        .memory-stat-value {{
+            font-size: 1.8em;
+            font-weight: 700;
+            color: #1e293b;
+        }}
+        
+        .memory-viz {{
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }}
+        .memory-bar {{
+            height: 40px;
+            background: #e2e8f0;
+            border-radius: 20px;
+            position: relative;
+            overflow: hidden;
+            margin: 20px 0;
+        }}
+        .memory-bar-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            border-radius: 20px;
+            position: relative;
+            transition: width 1s ease;
+            display: flex;
+            align-items: center;
+            padding: 0 15px;
+            color: white;
+            font-weight: 600;
+            font-size: 0.9em;
+        }}
+        
+        .address-ranges {{
+            display: grid;
+            gap: 10px;
+            margin-top: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }}
+        .address-range {{
+            background: #f8fafc;
+            padding: 12px 15px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 0.9em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .address-range:hover {{
+            background: #e2e8f0;
+        }}
+        
+        table {{ 
+            width: 100%; 
+            border-collapse: separate;
+            border-spacing: 0;
+            margin-bottom: 30px;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }}
+        th, td {{ 
+            text-align: left; 
+            padding: 15px 20px;
+        }}
+        th {{ 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.85em;
+            letter-spacing: 0.5px;
+        }}
+        tr:hover {{ background-color: #f8fafc; }}
+        td {{ border-bottom: 1px solid #e2e8f0; }}
+        tr:last-child td {{ border-bottom: none; }}
+        
+        .section {{
+            margin-bottom: 40px;
+        }}
+        .section h2 {{
+            color: #1e293b;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+        }}
+        
+        footer {{ 
+            text-align: center; 
+            padding: 30px;
+            background: #f8fafc;
+            color: #64748b;
+            font-size: 0.9em;
+        }}
+        
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(20px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        .card, .memory-map, .section {{ 
+            animation: fadeIn 0.6s ease forwards;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 A2L Validation Report</h1>
+            <p>Comprehensive Analysis & Memory Mapping</p>
+        </div>
+        
+        <div class="content">
+            <div class="summary-cards">
+                <div class="card error">
+                    <h3>Errors</h3>
+                    <div class="count">{error_count}</div>
+                </div>
+                <div class="card warning">
+                    <h3>Warnings</h3>
+                    <div class="count">{warning_count}</div>
+                </div>
+                <div class="card info">
+                    <h3>Info</h3>
+                    <div class="count">{info_count}</div>
+                </div>
+            </div>
+            
+            {memory_map}
+            
+            <div class="section">
+                <h2>📋 Details</h2>
+                {content}
+            </div>
+        </div>
+        
+        <footer>
+            Generated by a2l2xdf • Advanced A2L to XDF Converter
+        </footer>
+    </div>
+</body>
+</html>
+        """
+        
+        # Generate memory map visualization
+        memory_map_html = ""
+        if self.address_map:
+            # Calculate memory statistics
+            addresses = sorted(self.address_map.keys())
+            if addresses:
+                min_addr = addresses[0]
+                max_addr = addresses[-1]
+                total_range = max_addr - min_addr
+                num_addresses = len(addresses)
+                
+                # Calculate coverage percentage (assuming 4MB default region)
+                coverage_pct = min(100, (total_range / 0x400000) * 100)
+                
+                memory_map_html = f"""
+            <div class="memory-map">
+                <h2>Memory Map</h2>
+                
+                <div class="memory-stats">
+                    <div class="memory-stat">
+                        <div class="memory-stat-label">Unique Addresses</div>
+                        <div class="memory-stat-value">{num_addresses:,}</div>
+                    </div>
+                    <div class="memory-stat">
+                        <div class="memory-stat-label">Address Range</div>
+                        <div class="memory-stat-value">{hex(min_addr)} - {hex(max_addr)}</div>
+                    </div>
+                    <div class="memory-stat">
+                        <div class="memory-stat-label">Total Span</div>
+                        <div class="memory-stat-value">{total_range:,} bytes</div>
+                    </div>
+                    <div class="memory-stat">
+                        <div class="memory-stat-label">Coverage</div>
+                        <div class="memory-stat-value">{coverage_pct:.1f}%</div>
+                    </div>
+                </div>
+                
+                <div class="memory-viz">
+                    <strong>Memory Usage</strong>
+                    <div class="memory-bar">
+                        <div class="memory-bar-fill" style="width: {min(coverage_pct, 100)}%">
+                            {num_addresses:,} characteristics
+                        </div>
+                    </div>
+                    
+                    <div class="address-ranges">
+                        <strong style="display: block; margin-bottom: 10px;">Address Samples (first 20):</strong>
+"""
+                # Show first 20 address mappings as examples
+                for addr in addresses[:20]:
+                    chars = self.address_map[addr]
+                    char_list = ", ".join(chars[:3])  # Show first 3 characteristics
+                    if len(chars) > 3:
+                        char_list += f" ... +{len(chars)-3} more"
+                    memory_map_html += f"""
+                        <div class="address-range">
+                            <span><strong>{hex(addr)}</strong></span>
+                            <span>{char_list}</span>
+                        </div>
+"""
+                
+                if len(addresses) > 20:
+                    memory_map_html += f"""
+                        <div class="address-range" style="background: #e0f2fe; border-color: #0ea5e9;">
+                            <span><em>... and {len(addresses) - 20:,} more addresses</em></span>
+                        </div>
+"""
+                
+                memory_map_html += """
+                    </div>
+                </div>
+            </div>
+"""
+        
+        content_parts = []
+        
+        if self.errors:
+            content_parts.append("<h3>❌ Errors</h3><table><thead><tr><th>Message</th></tr></thead><tbody>")
+            for err in self.errors:
+                content_parts.append(f"<tr><td>{err}</td></tr>")
+            content_parts.append("</tbody></table>")
+            
+        if self.warnings:
+            content_parts.append("<h3>⚠️ Warnings</h3><table><thead><tr><th>Message</th></tr></thead><tbody>")
+            for warn in self.warnings:
+                content_parts.append(f"<tr><td>{warn}</td></tr>")
+            content_parts.append("</tbody></table>")
+            
+        if self.info:
+            content_parts.append("<h3>✓ Info</h3><ul>")
+            for msg in self.info:
+                content_parts.append(f"<li>{msg}</li>")
+            content_parts.append("</ul>")
+
+        html_content = html_template.format(
+            error_count=len(self.errors),
+            warning_count=len(self.warnings),
+            info_count=len(self.info),
+            memory_map=memory_map_html,
+            content="".join(content_parts)
+        )
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        print(f"Validation report written to: {output_path}")
 
 # Global validation report instance
 validation_report = ValidationReport()
@@ -872,10 +1314,18 @@ def resolve_axis_source(ar: inspect.AxisDescr):
     """
     axis = getattr(ar, "axisPtsRef", None)
     if axis is not None:
+        # Track AXIS_PTS reference for validation
+        axis_name = getattr(axis, "name", None)
+        if axis_name:
+            validation_report.add_axis_pts_reference(axis_name)
         return axis, "AXIS_PTS_REF"
 
     com_axis = getattr(ar, "comAxisRef", None)
     if com_axis is not None:
+        # Track COM_AXIS reference (also counts as AXIS_PTS usage)
+        com_axis_name = getattr(com_axis, "name", None)
+        if com_axis_name:
+            validation_report.add_axis_pts_reference(com_axis_name)
         return com_axis, "COM_AXIS_REF"
 
     axis_descr_ref = getattr(ar, "axisDescrRef", None)
@@ -1176,12 +1626,13 @@ def _axis_ref_to_dict_inner(ar: inspect.AxisDescr, depth: int = 0) -> Optional[D
         ref_axis_descr = axis_list[0]
         return _axis_ref_to_dict_inner(ref_axis_descr, depth + 1)
 
-    # STD_AXIS with DEPOSIT ABSOLUTE but no detailed layout info
-    # The axis is stored inline - we need to mark it for special handling
-    # Since we don't have the characteristic address here, we return a marker
-    # that tells the caller to handle this specially
+    # STD_AXIS with DEPOSIT ABSOLUTE - can be inline OR computed
+    # Check if we have enough info to generate synthetic values (computed axis)
     if axis_type == "STD_AXIS_DEPOSIT_ABSOLUTE":
         length = getattr(ar, "maxAxisPoints", None)
+        lower = getattr(ar, "lowerLimit", None)
+        upper = getattr(ar, "upperLimit", None)
+        
         if length is None:
             logging.debug(
                 "Axis %r has STD_AXIS_DEPOSIT_ABSOLUTE but no maxAxisPoints",
@@ -1191,13 +1642,45 @@ def _axis_ref_to_dict_inner(ar: inspect.AxisDescr, depth: int = 0) -> Optional[D
 
         coeffs = compu.coeffs if (compu is not None and hasattr(compu, "coeffs")) else None
         math = coefficients_to_equation(coeffs) if coeffs is not None else "X"
+        
+        # Check if this is a computed axis (has limits) vs inline axis (no limits)
+        if lower is not None and upper is not None:
+            try:
+                num_points = int(length)
+                if num_points > 1:
+                    # Generate synthetic values for computed axis
+                    step = (upper - lower) / (num_points - 1)
+                    values = [lower + (i * step) for i in range(num_points)]
+                    
+                    logging.debug(
+                        "Generated synthetic computed axis %r: %d points from %.2f to %.2f",
+                        axis_name, num_points, lower, upper
+                    )
+                    
+                    return {
+                        "name": display_name,
+                        "units": units,
+                        "min": lower,
+                        "max": upper,
+                        "address": None,  # No memory address - computed
+                        "length": num_points,
+                        "dataSize": None,  # Not in memory
+                        "math": math,
+                        "values": values,  # Synthetic values for LABELS
+                        "lsb_first": True,
+                        "enum": enum_map,
+                        "enum_range": range_map,
+                        "synthetic": True,  # Marker that this is computed
+                    }
+            except Exception as e:
+                logging.debug("Failed to generate synthetic axis %r: %s", axis_name, e)
 
-        # Return with special marker - address will be calculated by caller
+        # Otherwise, it's an inline axis (stored with characteristic data)
         return {
             "name": display_name,
             "units": units,
-            "min": getattr(ar, "lowerLimit", 0.0),
-            "max": getattr(ar, "upperLimit", 0.0),
+            "min": lower if lower is not None else 0.0,
+            "max": upper if upper is not None else 0.0,
             "address": None,  # Will be set by caller based on characteristic layout
             "length": int(length),
             "dataSize": "UBYTE",  # Default, may need to be determined from record layout
@@ -1335,6 +1818,22 @@ def real_axis(table: Element, axis_id: str, axis_def: Dict[str, Any]) -> None:
     max_val = axis_def.get("max", 0.0)
     units = axis_def.get("units", "")
     math = axis_def.get("math", "X")
+    # If this axis has pre-generated values (synthetic/computed axis), use LABELS
+    if "values" in axis_def and axis_def.get("synthetic"):
+        values = axis_def["values"]
+        for val in values:
+            SubElement(a,"LABEL", value=str(val), index=str(values.index(val)))
+        
+        # Set embarkeddata with no address for computed axes
+        e = SubElement(a, "EMBEDDEDDATA")
+        e.set("mmedtypeflags", "0x02")  # Axis data
+        e.set("mmedaddress", "0x0")  # No physical address
+        e.set("mmedelementsizebits", "0")
+        e.set("mmedmajorstridebits", "0")
+        e.set("mmedminorstridebits", "0")
+        return
+
+    # Standard memory-mapped or fixed axis handling
     address = axis_def.get("address")
     data_size = axis_def.get("dataSize")
     values: Optional[List[Any]] = axis_def.get("values")
@@ -1526,12 +2025,10 @@ def write_pretty_xml(root, out):
     with open(out, "w", encoding="utf-8") as f:
         f.write(parsed.toprettyxml(indent="  "))
     print("  - Processed {} unique addresses".format(len(data_addresses_in_xdf)))
-    print("  - Total characteristics: {}".format(len(char_type_stats) + sum(char_type_stats.values()) if not char_type_stats else sum(char_type_stats.values()))) # wait, char_type_stats has counts. sum() is correct.
+    
     # Recalculate char stats sum correctly from Counter
     total_chars = sum(char_type_stats.values())
     print("  - Total characteristics: {}".format(total_chars))
-    print("  - Total functions: {}".format(function_count))
-    print("  - Functions with descriptions: {}".format(len(function_descriptions)))
     print("============================================================")
 
 
@@ -1963,6 +2460,47 @@ def get_segments(session):
     return session.query(model.MemorySegment).order_by(model.MemorySegment.address).all()
 
 
+def create_xdf_flag(root: Element, td: Dict[str, Any], categories: List[str]):
+    """Create an XDFFLAG element for single-bit characteristics."""
+    f = SubElement(root, "XDFFLAG")
+    f.set("uniqueid", new_unique_id())
+    f.set("flags", "0x0")  # Standard flag
+
+    SubElement(f, "title").text = td["title"]
+    SubElement(f, "description").text = td["description"]
+    
+    # Categories
+    add_table_categories(f, categories)
+    
+    # Embedded Data
+    # Flags in XDF are simple: address, datasize, mask
+    z = td["z"]
+    e = SubElement(f, "EMBEDDEDDATA")
+    e.set("mmedtypeflags", "0x02") # Unsigned, nothing special
+    e.set("mmedaddress", str(z.get("address", "0x0")))
+    e.set("mmedelementsizebits", str(get_data_size(z.get("dataSize", "UBYTE")) * 8))
+    e.set("mmedmajorstridebits", "0")
+    e.set("mmedminorstridebits", "0")
+    
+    # Mask
+    SubElement(f, "mask").text = hex(z["bitmask"])
+
+
+def get_block_length(ci: inspect.Characteristic, c: model.Characteristic) -> int:
+    """Helper to determine block length for VAL_BLK."""
+    # Check for direct 'number' attribute (MATRIX_DIM)
+    number = getattr(ci, "number", None)
+    if number is not None:
+        if isinstance(number, (int, float)):
+             return int(number)
+        if hasattr(number, "value"):
+             return int(number.value)
+    
+    # Fallback to checking the matrix/array size if available
+    # ... implementation specific ...
+    return 1
+
+
 def process_all(session, root, header, args):
     # Get all characteristics from the DB
     chars = session.query(model.Characteristic).order_by(model.Characteristic.name).all()
@@ -1998,12 +2536,18 @@ def process_all(session, root, header, args):
                 # If ch is an object, get its name
                 ch_name = getattr(ch, "name", str(ch))
                 char_categories.setdefault(ch_name, set()).add(f"FUNC:{fn_name}")
+                # Track cross-reference
+                if args.validate:
+                    validation_report.add_char_reference(ch_name)
             
             # Also check ref_characteristic if available
             refs = getattr(f, "ref_characteristic", None) or getattr(f, "refCharacteristics", None) or []
             for ch in refs:
                 ch_name = getattr(ch, "name", str(ch))
                 char_categories.setdefault(ch_name, set()).add(f"FUNC:{fn_name}")
+                # Track cross-reference
+                if args.validate:
+                    validation_report.add_char_reference(ch_name)
     except Exception:
         pass
     try:
@@ -2013,6 +2557,9 @@ def process_all(session, root, header, args):
             members = getattr(g, "refCharacteristics", None) or getattr(g, "ref_characteristics", None) or []
             for ch in members:
                 char_categories.setdefault(ch, set()).add(f"GRP:{gname}")
+                # Track cross-reference
+                if args.validate:
+                    validation_report.add_char_reference(ch)
     except Exception:
         pass
 
@@ -2025,6 +2572,10 @@ def process_all(session, root, header, args):
     name_filter: Optional[re.Pattern] = re.compile(args.name_filter) if args.name_filter else None
 
     for c in chars:
+        # Track characteristic definition
+        if args.validate:
+            validation_report.add_char_definition(c.name)
+        
         try:
             ci = inspect.Characteristic(session, c.name)
         except Exception as e:
@@ -2311,45 +2862,180 @@ def process_all(session, root, header, args):
         except Exception:
             pass
 
-        # Create main table
-        t = SubElement(root, "XDFTABLE")
-        t.set("uniqueid", new_unique_id())
-        t.set("flags", "0x30")
-
-        SubElement(t, "title").text = td["title"]
-        SubElement(t, "description").text = td["description"]
+        # Create XDF Element (Flag or Table)
+        z_bitmask = td["z"].get("bitmask")
+        is_single_bit = False
+        if z_bitmask:
+             is_single_bit = (z_bitmask > 0) and ((z_bitmask & (z_bitmask - 1)) == 0)
+             logging.debug("Characteristic %s has bitmask 0x%X (single_bit=%s, length=%d)", 
+                           c.name, z_bitmask, is_single_bit, int(td["z"].get("length", 1)))
+        
+        # Build categories list
         cats = [td["category"]]
         cats.extend(char_categories.get(c.name, []))
-        add_table_categories(t, cats)
 
-        # X axis handling
-        if "x" in td:
-            # Has real axis from axis descriptions
-            real_axis(t, "x", td["x"])
-            maybe_make_axis_table(root, td, "x")
+        if is_single_bit and int(td["z"].get("length", 1)) == 1:
+            # Create Native XDF Flag
+            create_xdf_flag(root, td, cats)
+            logging.debug("Characteristic %s converted to XDFFLAG (mask: 0x%X)", c.name, z_bitmask)
         else:
-            # No axis descriptions - create fake axis sized to Z length
-            z_len = int(td["z"].get("length", 1))
-            fake_axis(t, "x", z_len)
+            # Create Standard XDF Table
+            t = SubElement(root, "XDFTABLE")
+            t.set("uniqueid", new_unique_id())
+            t.set("flags", "0x30")  # Standard table flags
 
-        # Y axis handling
-        if "y" in td:
-            real_axis(t, "y", td["y"])
-            maybe_make_axis_table(root, td, "y")
-        else:
-            fake_axis(t, "y", 1)
+            SubElement(t, "title").text = td["title"]
+            SubElement(t, "description").text = td["description"]
+            add_table_categories(t, cats)
 
-        # Z axis (the actual data)
-        z_addr = td["z"].get("address")
-        if z_addr and z_addr in data_addresses_in_xdf:
-            logging.debug("Duplicate data address detected for %s at %s", c.name, z_addr)
-        data_addresses_in_xdf.add(z_addr)
-        real_axis(t, "z", td["z"])
+            # X axis handling
+            if "x" in td:
+                real_axis(t, "x", td["x"])
+                maybe_make_axis_table(root, td, "x")
+            else:
+                z_len = int(td["z"].get("length", 1))
+                fake_axis(t, "x", z_len)
 
-        # Enumeration mapping for discrete values
-        if td["z"].get("enum") or td["z"].get("enum_range"):
-            add_enumeration(t, td["z"].get("enum", {}), td["z"].get("enum_range", {}))
+            # Y axis handling
+            if "y" in td:
+                real_axis(t, "y", td["y"])
+                maybe_make_axis_table(root, td, "y")
+            else:
+                fake_axis(t, "y", 1)
+
+            # Z axis (the actual data)
+            z_addr = td["z"].get("address")
+            if z_addr and z_addr in data_addresses_in_xdf:
+                logging.debug("Duplicate data address detected for %s at %s", c.name, z_addr)
+            data_addresses_in_xdf.add(z_addr)
+            real_axis(t, "z", td["z"])
+
+            # Enumeration mapping
+            if td["z"].get("enum") or td["z"].get("enum_range"):
+                add_enumeration(t, td["z"].get("enum", {}), td["z"].get("enum_range", {}))
+            
         processed_count += 1
+
+    # Process INSTANCEs (Structure Flattening)
+    try:
+        if hasattr(model, 'Instance'):
+            instances = session.query(model.Instance).all()
+            typedef_structures = {}
+            
+            # First, query all TYPEDEF_STRUCTURE definitions
+            if hasattr(model, 'TypedefStructure'):
+                try:
+                    structures = session.query(model.TypedefStructure).all()
+                    for struct in structures:
+                        struct_name = getattr(struct, 'name', None)
+                        if struct_name:
+                            # Get structure components
+                            components = getattr(struct, 'structureComponents', None) or getattr(struct, 'structure_components', None) or []
+                            typedef_structures[struct_name] = components
+                    logging.info("Found %d TYPEDEF_STRUCTURE definitions", len(typedef_structures))
+                except Exception as e:
+                    logging.debug("TYPEDEF_STRUCTURE query failed: %s", e)
+            
+            if instances:
+                logging.info("Found %d INSTANCEs - starting structure flattening", len(instances))
+                
+                for inst in instances:
+                    inst_name = getattr(inst, 'name', None)
+                    inst_type = getattr(inst, 'typeName', None) or getattr(inst, 'type_name', None)
+                    inst_addr = getattr(inst, 'address', None)
+                    
+                    if not inst_name or not inst_type:
+                        logging.debug("Skipping instance %s - missing name or type", inst_name or "unknown")
+                        continue
+                    
+                    # Get the structure definition
+                    components = typedef_structures.get(inst_type, [])
+                    
+                    if not components:
+                        logging.warning("Instance %s references unknown structure type %s", inst_name, inst_type)
+                        continue
+                    
+                    # Create category for this instance
+                    instance_category = f"STRUCT:{inst_name}"
+                    add_category(header, instance_category)
+                    
+                    # Flatten each component into an XDF characteristic
+                    for comp in components:
+                        comp_name = getattr(comp, 'componentName', None) or getattr(comp, 'name', None)
+                        comp_type = getattr(comp, 'componentType', None) or getattr(comp, 'data_type', None)
+                        comp_offset = getattr(comp, 'addressOffset', None) or getattr(comp, 'address_offset', None) or 0
+                        
+                        if not comp_name:
+                            continue
+                        
+                        # Generate flattened characteristic name
+                        flat_name = f"{inst_name}_{comp_name}"
+                        
+                        # Calculate absolute address
+                        if inst_addr is not None:
+                            flat_addr = inst_addr + comp_offset
+                        else:
+                            logging.warning("Instance %s has no base address - skipping", inst_name)
+                            continue
+                        
+                        # Determine data size (default to UBYTE if unknown)
+                        data_size = comp_type or "UBYTE"
+                        
+                        # Create XDF element for this flattened member
+                        try:
+                            # Create as a simple scalar value (XDFCONSTANT equivalent)
+                            t = SubElement(root, "XDFTABLE")
+                            t.set("uniqueid", new_unique_id())
+                            t.set("flags", "0x30")
+                            
+                            SubElement(t, "title").text = flat_name
+                            SubElement(t, "description").text = f"Structure member: {inst_name}.{comp_name}"
+                            
+                            # Add to structure category
+                            add_table_categories(t, ["Values", instance_category])
+                            
+                            # Create minimal axes (1x1 scalar)
+                            fake_axis(t, "x", 1)
+                            fake_axis(t, "y", 1)
+                            
+                            # Z axis with actual data
+                            z_info = {
+                                "name": comp_name,
+                                "units": "",
+                                "min": 0.0,
+                                "max": 255.0,
+                                "address": hex(adjust_address(flat_addr)),
+                                "length": 1,
+                                "dataSize": data_size,
+                                "math": "X",
+                                "lsb_first": True,
+                                "rows": 1,
+                            }
+                            real_axis(t, "z", z_info)
+                            
+                            processed_count += 1
+                            logging.debug("Flattened: %s -> %s at %s", inst_name, flat_name, hex(flat_addr))
+                            
+                        except Exception as e:
+                            logging.error("Failed to create flattened characteristic %s: %s", flat_name, e)
+                
+                logging.info("Structure flattening complete - processed %d instance members", processed_count - len(chars))
+            else:
+                logging.info("No INSTANCEs found in A2L file")
+        else:
+            logging.info("pya2l.model.Instance not supported by installed library")
+    except Exception as e:
+        logging.debug("Structure flattening skipped: %s", e)
+    
+    # Query all AXIS_PTS definitions for cross-reference validation
+    if args.validate:
+        try:
+            all_axis_pts = session.query(model.AxisPts).all()
+            for axis_pt in all_axis_pts:
+                validation_report.add_axis_pts_definition(axis_pt.name)
+            logging.info("Cross-reference validation: tracked %d AXIS_PTS definitions", len(all_axis_pts))
+        except Exception as e:
+            logging.debug("AXIS_PTS tracking skipped: %s", e)
 
     logging.info(f"Processed {processed_count} characteristics, skipped {skipped_count}")
     if skipped_reasons:
@@ -2400,12 +3086,12 @@ def process_all(session, root, header, args):
         logging.info("  FIX_AXIS_PAR_DIST         : Fixed axis with distance")
         logging.info("  FIX_AXIS_PAR_LIST         : Fixed axis with explicit list")
         logging.info("  CURVE_AXIS_REF            : Reference to another curve's axis")
-        logging.info("  DEPOSIT_ABSOLUTE_NO_PARAMS: Computed axes without layout (excluded)")
+        logging.info("  DEPOSIT_ABSOLUTE_NO_PARAMS: Computed axes (synthetic values based on limits)")
         logging.info("")
-        logging.info("Note: Only MEMORY_MAPPED and FIX_* axes get full XDF support.")
-        logging.info("      Purely computed axes without addresses are skipped.")
+        logging.info("Note: Computed axes without addresses are generated with synthetic values.")
+        logging.info("      Memory-mapped axes (with addresses) are preferred for live tuning.")
     
-    return processed_count, len(functions) if 'functions' in locals() else 0
+    return processed_count, len(functions) if 'functions' in locals() else 0, len(function_descriptions)
 
 
 def parse_args():
@@ -2523,11 +3209,16 @@ def main():
     except Exception:
         SEGMENTS = []
 
-    processed_count, function_count = process_all(session, root, header, args)
+    processed_count, total_functions, described_functions = process_all(session, root, header, args)
 
     out = args.output or f"{a2l_base}.xdf"
     write_pretty_xml(root, out)
     logging.info("Wrote XDF: %s", out)
+
+    # Print basic statistics
+    print("  - Total functions: {}".format(total_functions))
+    print("  - Functions with descriptions: {}".format(described_functions))
+    print("============================================================")
 
     # Generate ADX for MEASUREMENTs (unless disabled)
     if not args.no_adx:
@@ -2544,14 +3235,26 @@ def main():
     
     # Print validation summary if enabled
     if args.validate:
+        # Run cross-reference validation
+        validation_report.validate_cross_references()
+        
         # Add summary info messages
         validation_report.add_info(f"Processed {len(validation_report.address_map)} unique addresses")
         validation_report.add_info(f"Total characteristics: {sum(char_type_stats.values())}")
-        if function_count > 0:
-            validation_report.add_info(f"Functions with descriptions: {function_count}")
+        if total_functions > 0:
+            validation_report.add_info(f"Total functions: {total_functions}")
+            validation_report.add_info(f"Functions with descriptions: {described_functions}")
         
         # Print the summary
         validation_report.print_summary()
+        
+        # Write HTML report
+        report_path = f"{out}.html"
+        try:
+            validation_report.write_html(report_path)
+            logging.info(f"HTML Validation Report: {report_path}")
+        except Exception as e:
+            logging.error(f"Failed to write HTML report: {e}")
 
 
 if __name__ == "__main__":
